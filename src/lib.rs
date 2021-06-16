@@ -1,7 +1,38 @@
-#![allow(clippy::many_single_char_names)]
+// Copyright 2021 Weiyi Wang
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-// Ported from https://github.com/yuzu-emu/yuzu/blob/2f30c105849c214345e2201f4bd6f9b4b76ab4a1/src/video_core/textures/astc.cpp
-// Buggy
+// The code is ported from an ASTC decoder in C++ with a few bug fixes.
+// Here is the copyright notice from the original code:
+//
+// Copyright 2016 The University of North Carolina at Chapel Hill
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Please send all BUG REPORTS to <pavel@cs.unc.edu>.
+// <http://gamma.cs.unc.edu/FasTC/>
+
+#![allow(clippy::many_single_char_names)]
 
 use std::convert::TryFrom;
 use std::io::*;
@@ -1225,6 +1256,11 @@ fn compute_endpoints(
     }
 }
 
+/// Configuration for ASTC block footprint size
+///
+/// This struct provides predefined constants for supported footprint in the specification,
+/// as well as a constructor for custom footprint. It is recommended to use only the predefined constants.
+/// The constructor can be used when you want to pass in dimensions defined numerically in other file formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Footprint {
     block_width: u32,
@@ -1232,63 +1268,64 @@ pub struct Footprint {
 }
 
 impl Footprint {
-    pub const F4X4: Footprint = Footprint {
+    pub const ASTC_4X4: Footprint = Footprint {
         block_width: 4,
         block_height: 4,
     };
-    pub const F5X4: Footprint = Footprint {
+    pub const ASTC_5X4: Footprint = Footprint {
         block_width: 5,
         block_height: 4,
     };
-    pub const F5X5: Footprint = Footprint {
+    pub const ASTC_5X5: Footprint = Footprint {
         block_width: 5,
         block_height: 5,
     };
-    pub const F6X5: Footprint = Footprint {
+    pub const ASTC_6X5: Footprint = Footprint {
         block_width: 6,
         block_height: 5,
     };
-    pub const F6X6: Footprint = Footprint {
+    pub const ASTC_6X6: Footprint = Footprint {
         block_width: 6,
         block_height: 6,
     };
-    pub const F8X5: Footprint = Footprint {
+    pub const ASTC_8X5: Footprint = Footprint {
         block_width: 8,
         block_height: 5,
     };
-    pub const F8X6: Footprint = Footprint {
+    pub const ASTC_8X6: Footprint = Footprint {
         block_width: 8,
         block_height: 6,
     };
-    pub const F10X5: Footprint = Footprint {
+    pub const ASTC_10X5: Footprint = Footprint {
         block_width: 10,
         block_height: 5,
     };
-    pub const F10X6: Footprint = Footprint {
+    pub const ASTC_10X6: Footprint = Footprint {
         block_width: 10,
         block_height: 6,
     };
-    pub const F8X8: Footprint = Footprint {
+    pub const ASTC_8X8: Footprint = Footprint {
         block_width: 8,
         block_height: 8,
     };
-    pub const F10X8: Footprint = Footprint {
+    pub const ASTC_10X8: Footprint = Footprint {
         block_width: 10,
         block_height: 8,
     };
-    pub const F10X10: Footprint = Footprint {
+    pub const ASTC_10X10: Footprint = Footprint {
         block_width: 10,
         block_height: 10,
     };
-    pub const F12X10: Footprint = Footprint {
+    pub const ASTC_12X10: Footprint = Footprint {
         block_width: 12,
         block_height: 10,
     };
-    pub const F12X12: Footprint = Footprint {
+    pub const ASTC_12X12: Footprint = Footprint {
         block_width: 12,
         block_height: 12,
     };
 
+    /// Constructs custom footprint. Panic if any of the dimensions is zero.
     pub fn new(block_width: u32, block_height: u32) -> Footprint {
         if block_width == 0 || block_height == 0 {
             panic!("Invalid block size")
@@ -1299,22 +1336,43 @@ impl Footprint {
         }
     }
 
+    /// Returns the block width.
     pub fn block_width(&self) -> u32 {
         self.block_width
     }
 
+    /// Returns the block height.
     pub fn block_height(&self) -> u32 {
         self.block_height
     }
 }
 
-pub fn atsc_decompress_block<F: FnMut(u32, u32, [u8; 4])>(
-    in_buf: &[u8; 16],
-    block_width: u32,
-    block_height: u32,
+/// Decode an ASTC block from a 16-byte buffer.
+///
+///  - `input` contains the raw ASTC data for one block.
+///  - `footprint` specifies the footprint size.
+///  - `writer` is a function with signature `FnMut(x: u32, y: u32, color: [u8; 4])`.
+///     It is used to output decoded pixels.
+///     This function will be called once for each pixel `(x, y)` in the rectangle
+///     `[0, footprint.width()) * [0, footprint.height())`.
+///     Each element in `color` represents the R, G, B, and A channel, respectively.
+/// ```
+/// let footprint = astc_decode::Footprint::new(6, 6);
+/// // Exmaple input. Not necessarily a valid ASTC block
+/// let input = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+/// let mut output = [[0; 4]; 6 * 6];
+/// astc_decode::astc_decode_block(&input, footprint, |x, y, color| {
+///     output[(x + y * 6) as usize] = color;
+/// });
+/// ```
+pub fn astc_decode_block<F: FnMut(u32, u32, [u8; 4])>(
+    input: &[u8; 16],
+    footprint: Footprint,
     mut writer: F,
 ) {
-    let mut strm = InputBitStream::new(u128::from_le_bytes(*in_buf));
+    let block_width = footprint.block_width;
+    let block_height = footprint.block_height;
+    let mut strm = InputBitStream::new(u128::from_le_bytes(*input));
     let weight_params = decode_block_info(&mut strm);
 
     // Was there an error?
@@ -1464,7 +1522,7 @@ pub fn atsc_decompress_block<F: FnMut(u32, u32, [u8; 4])>(
     }
 
     // Read the texel weight data..
-    let mut texel_weight_data = u128::from_le_bytes(*in_buf).reverse_bits();
+    let mut texel_weight_data = u128::from_le_bytes(*input).reverse_bits();
 
     // Make sure that higher non-texel bits are set to zero
     texel_weight_data &= (1 << weight_params.get_packed_bit_size()) - 1;
@@ -1523,14 +1581,36 @@ pub fn atsc_decompress_block<F: FnMut(u32, u32, [u8; 4])>(
     }
 }
 
-pub fn atsc_decompress<R: Read, F: FnMut(u32, u32, [u8; 4])>(
+/// Decode an ASTC image, assuming linear block layout.
+///
+///  - `input` us used to read raw ASTC data.
+///  - `width` and `height` specify the image dimensions.
+///  - `footprint` specifies the footprint size.
+///  - `writer` is a function with signature `FnMut(x: u32, y: u32, color: [u8; 4])`.
+///     It is used to output decoded pixels.
+///     This function will be called once for each pixel `(x, y)` in the rectangle
+///     `[0, width) * [0, height)`.
+///     Each element in `color` represents the R, G, B, and A channel, respectively.
+///  - Returns success or IO error encountered when reading `input`.
+/// ```
+/// let footprint = astc_decode::Footprint::new(6, 6);
+/// // Exmaple input. Not necessarily valid ASTC image
+/// let input = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+/// let mut output = [[0; 4]; 5 * 3];
+/// astc_decode::astc_decode(&input[..], 5, 3, footprint, |x, y, color| {
+///     output[(x + y * 5) as usize] = color;
+/// }).unwrap();
+/// ```
+pub fn astc_decode<R: Read, F: FnMut(u32, u32, [u8; 4])>(
     mut input: R,
     width: u32,
     height: u32,
-    block_width: u32,
-    block_height: u32,
+    footprint: Footprint,
     mut writer: F,
 ) -> Result<()> {
+    let block_width = footprint.block_width;
+    let block_height = footprint.block_height;
+
     let block_w = (width.checked_add(block_width).unwrap() - 1) / block_width;
     let block_h = (height.checked_add(block_height).unwrap() - 1) / block_height;
 
@@ -1538,7 +1618,7 @@ pub fn atsc_decompress<R: Read, F: FnMut(u32, u32, [u8; 4])>(
         for bx in 0..block_w {
             let mut block_buf = [0; 16];
             input.read_exact(&mut block_buf)?;
-            atsc_decompress_block(&block_buf, block_width, block_height, |x, y, v| {
+            astc_decode_block(&block_buf, footprint, |x, y, v| {
                 let x = bx * block_width + x;
                 let y = by * block_height + y;
                 if x < width && y < height {
@@ -1564,12 +1644,11 @@ mod tests {
         let bmp = image::load_from_memory(bmp).unwrap().to_rgba8();
         let width = bmp.width();
         let height = bmp.height();
-        atsc_decompress(
+        astc_decode(
             &astc[16..],
             width,
             height,
-            block_width,
-            block_height,
+            Footprint::new(block_width, block_height),
             |x, y, v| {
                 let y = height - y - 1;
                 let p = bmp.get_pixel(x as u32, y as u32).channels();
