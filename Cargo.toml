@@ -3,6 +3,12 @@ name = "astc-decode"
 version = "0.1.0"
 authors = ["Weiyi Wang <wwylele@gmail.com>"]
 edition = "2018"
+license = "Apache-2.0"
+description = "A software ASTC decoder in rust"
+repository = "https://github.com/wwylele/astc-decode"
+readme = "README.md"
+keywords = ["image", "astc", "codec", "graphics", "texture"]
+categories = ["multimedia::images", "encoding"]
 
 [dependencies]
 
