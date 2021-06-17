@@ -103,12 +103,12 @@ enum IntegerEncodingType {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct IntegerEncodedFormat {
+struct IntegerEncodingFormat {
     encoding: IntegerEncodingType,
     num_bits: u32,
 }
 
-impl IntegerEncodedFormat {
+impl IntegerEncodingFormat {
     // Returns the number of bits required to encode nVals values.
     fn get_bit_length(&self, n_vals: u32) -> u32 {
         let mut total_bits = self.num_bits * n_vals;
@@ -245,13 +245,13 @@ fn decode_quint_block(
 
 // Returns a new instance of this struct that corresponds to the
 // can take no more than maxval values
-const fn create_encoding(mut max_val: u32) -> IntegerEncodedFormat {
+const fn create_encoding(mut max_val: u32) -> IntegerEncodingFormat {
     while max_val > 0 {
         let check = max_val + 1;
 
         // Is max_val a power of two?
         if (check & (check - 1)) == 0 {
-            return IntegerEncodedFormat {
+            return IntegerEncodingFormat {
                 encoding: IntegerEncodingType::JustBits,
                 num_bits: max_val.count_ones(),
             };
@@ -259,7 +259,7 @@ const fn create_encoding(mut max_val: u32) -> IntegerEncodedFormat {
 
         // Is max_val of the type 3*2^n - 1?
         if (check % 3 == 0) && ((check / 3) & ((check / 3) - 1)) == 0 {
-            return IntegerEncodedFormat {
+            return IntegerEncodingFormat {
                 encoding: IntegerEncodingType::Trit,
                 num_bits: (check / 3 - 1).count_ones(),
             };
@@ -267,7 +267,7 @@ const fn create_encoding(mut max_val: u32) -> IntegerEncodedFormat {
 
         // Is max_val of the type 5*2^n - 1?
         if (check % 5 == 0) && ((check / 5) & ((check / 5) - 1)) == 0 {
-            return IntegerEncodedFormat {
+            return IntegerEncodingFormat {
                 encoding: IntegerEncodingType::Quint,
                 num_bits: (check / 5 - 1).count_ones(),
             };
@@ -277,14 +277,14 @@ const fn create_encoding(mut max_val: u32) -> IntegerEncodedFormat {
         // just iterate.
         max_val -= 1;
     }
-    IntegerEncodedFormat {
+    IntegerEncodingFormat {
         encoding: IntegerEncodingType::JustBits,
         num_bits: 0,
     }
 }
 
-static ENCODINGS_VALUES: [IntegerEncodedFormat; 256] = {
-    let mut result = [IntegerEncodedFormat {
+static ENCODINGS_VALUES: [IntegerEncodingFormat; 256] = {
+    let mut result = [IntegerEncodingFormat {
         encoding: IntegerEncodingType::JustBits,
         num_bits: 0,
     }; 256];
@@ -300,11 +300,12 @@ static ENCODINGS_VALUES: [IntegerEncodedFormat; 256] = {
 // bitstream. We must know beforehand what the maximum possible
 // value is, and how many values we're decoding.
 fn decode_integer_sequence(
-    result: &mut Vec<IntegerEncodedValue>,
     bits: &mut InputBitStream,
     max_range: u32,
     n_values: u32,
-) {
+) -> Vec<IntegerEncodedValue> {
+    let mut result = vec![];
+
     // Determine encoding parameters
     let val = ENCODINGS_VALUES[max_range as usize];
 
@@ -313,12 +314,12 @@ fn decode_integer_sequence(
     while n_vals_decoded < n_values {
         match val.encoding {
             IntegerEncodingType::Quint => {
-                decode_quint_block(bits, result, val.num_bits);
+                decode_quint_block(bits, &mut result, val.num_bits);
                 n_vals_decoded += 3;
             }
 
             IntegerEncodingType::Trit => {
-                decode_trit_block(bits, result, val.num_bits);
+                decode_trit_block(bits, &mut result, val.num_bits);
                 n_vals_decoded += 5;
             }
             IntegerEncodingType::JustBits => {
@@ -332,6 +333,8 @@ fn decode_integer_sequence(
             }
         }
     }
+
+    result
 }
 
 struct TexelWeightParams {
@@ -360,13 +363,7 @@ impl Default for TexelWeightParams {
 
 impl TexelWeightParams {
     fn get_packed_bit_size(&self) -> u32 {
-        // How many indices do we have?
-        let mut nidxs = self.height * self.width;
-        if self.is_dual_plane {
-            nidxs *= 2;
-        }
-
-        ENCODINGS_VALUES[self.max_weight as usize].get_bit_length(nidxs)
+        ENCODINGS_VALUES[self.max_weight as usize].get_bit_length(self.get_num_weight_values())
     }
 
     fn get_num_weight_values(&self) -> u32 {
@@ -596,7 +593,7 @@ fn fill_error<F: FnMut(u32, u32, [u8; 4])>(writer: &mut F, block_width: u32, blo
     }
 }
 
-// Replicates low num_bits such that [(to_bit - 1):(to_bit - 1 - fromBit)]
+// Replicates low num_bits such that [(to_bit - 1):(to_bit - num_bits)]
 // is the same as [(num_bits - 1):0] and repeats all the way down.
 fn replicate(val: u32, mut num_bits: u32, to_bit: u32) -> u32 {
     if num_bits == 0 {
@@ -623,12 +620,13 @@ fn replicate(val: u32, mut num_bits: u32, to_bit: u32) -> u32 {
 }
 
 fn decode_color_values(
-    out: &mut [u8],
     data: u128,
     modes: &[u32],
     n_partitions: usize,
     n_bits_for_color_data: u32,
-) {
+) -> [u8; 32] {
+    let mut out = [0; 32]; // Four values, two endpoints, four maximum paritions
+
     // First figure out how many color values we have
     let n_values = modes[0..n_partitions]
         .iter()
@@ -661,15 +659,8 @@ fn decode_color_values(
     }
 
     // We now have enough to decode our integer sequence.
-    let mut decoded_color_values = vec![];
-
     let mut color_stream = InputBitStream::new(data);
-    decode_integer_sequence(
-        &mut decoded_color_values,
-        &mut color_stream,
-        range as u32,
-        n_values,
-    );
+    let decoded_color_values = decode_integer_sequence(&mut color_stream, range as u32, n_values);
 
     // Once we have the decoded values, we need to dequantize them to the 0-255 range
     // This procedure is outlined in ASTC spec c.2.13
@@ -686,7 +677,7 @@ fn decode_color_values(
         assert!(bitlen >= 1);
 
         // a is just the lsb replicated 9 times.
-        let a = replicate(bitval & 1, 1, 9);
+        let a = (bitval & 1) * 0x1FF;
         let mut b = 0;
         let mut c = 0;
         let mut d = 0;
@@ -795,13 +786,14 @@ fn decode_color_values(
             out_idx += 1;
         }
     }
+    out
 }
 
 fn unquantize_texel_weight(val: &IntegerEncodedValue) -> u32 {
     let bitval = val.bit_value;
     let bitlen = val.num_bits;
 
-    let a = replicate(bitval & 1, 1, 7);
+    let a = (bitval & 1) * 0x7F;
     let mut b = 0;
     let mut c = 0;
     let mut d = 0;
@@ -883,28 +875,20 @@ fn unquantize_texel_weight(val: &IntegerEncodedValue) -> u32 {
 }
 
 fn unquantize_texel_weights(
-    out: &mut [[u32; 144]; 2],
     weights: &[IntegerEncodedValue],
     params: &TexelWeightParams,
     block_width: u32,
     block_height: u32,
-) {
-    let mut weight_idx = 0u32;
+) -> [[u32; 144]; 2] {
+    // Blocks can be at most 12x12, so we can have as many as 144 weights
+    let mut out = [[0; 144]; 2];
     let mut unquantized = [[0; 144]; 2];
 
-    let mut itr = weights.iter();
-    while let Some(w) = itr.next() {
-        unquantized[0][weight_idx as usize] = unquantize_texel_weight(w);
+    let plane_scale = if params.is_dual_plane { 2 } else { 1 };
 
-        if params.is_dual_plane {
-            unquantized[1][weight_idx as usize] = unquantize_texel_weight(itr.next().unwrap());
-            /*if itr == weights.end() {
-                break;
-            }*/
-        }
-        weight_idx += 1;
-        if weight_idx >= params.width * params.height {
-            break;
+    for (i, weight_chunk) in weights.chunks_exact(plane_scale).enumerate() {
+        for (plane, weight) in weight_chunk.iter().enumerate() {
+            unquantized[plane][i] = unquantize_texel_weight(weight);
         }
     }
 
@@ -912,7 +896,6 @@ fn unquantize_texel_weights(
     let ds = (1024 + (block_width / 2)) / (block_width - 1);
     let dt = (1024 + (block_height / 2)) / (block_height - 1);
 
-    let plane_scale = if params.is_dual_plane { 2 } else { 1 };
     for plane in 0..plane_scale {
         for t in 0..block_height {
             for s in 0..block_width {
@@ -961,6 +944,7 @@ fn unquantize_texel_weights(
             }
         }
     }
+    out
 }
 
 // Transfers a bit as described in c.2.14
@@ -972,17 +956,6 @@ fn bit_transfer_signed(a: &mut i32, b: &mut i32) {
     if (*a & 0x20) != 0 {
         *a -= 0x40;
     }
-}
-
-// Adds more precision to the blue channel as described
-// in c.2.14
-fn blue_contract(a: i32, r: i32, g: i32, b: i32) -> [u8; 4] {
-    [
-        ((r + b) >> 1).clamp(0, 255) as u8,
-        ((g + b) >> 1).clamp(0, 255) as u8,
-        b.clamp(0, 255) as u8,
-        a.clamp(0, 255) as u8,
-    ]
 }
 
 // Partition selection functions as specified in
@@ -1113,7 +1086,7 @@ fn select_2d_partition(
     select_partition(seed, x, y, 0, partition_count, small_block)
 }
 
-fn clamp_color(a: i32, r: i32, g: i32, b: i32) -> [u8; 4] {
+fn clamp_color(r: i32, g: i32, b: i32, a: i32) -> [u8; 4] {
     [
         r.clamp(0, 255) as u8,
         g.clamp(0, 255) as u8,
@@ -1122,13 +1095,21 @@ fn clamp_color(a: i32, r: i32, g: i32, b: i32) -> [u8; 4] {
     ]
 }
 
+// Adds more precision to the blue channel as described
+// in c.2.14
+fn blue_contract(r: i32, g: i32, b: i32, a: i32) -> [u8; 4] {
+    [
+        ((r + b) >> 1).clamp(0, 255) as u8,
+        ((g + b) >> 1).clamp(0, 255) as u8,
+        b.clamp(0, 255) as u8,
+        a.clamp(0, 255) as u8,
+    ]
+}
+
 // Section c.2.14
-fn compute_endpoints(
-    ep1: &mut [u8; 4],
-    ep2: &mut [u8; 4],
-    color_values: &mut &[u8],
-    endpoint_mods: u32,
-) {
+fn compute_endpoints(color_values: &mut &[u8], endpoint_mods: u32) -> [[u8; 4]; 2] {
+    let ep1: [u8; 4];
+    let ep2: [u8; 4];
     macro_rules! read_int_values {
         ($N:expr) => {{
             let mut v = [0; $N];
@@ -1153,51 +1134,51 @@ fn compute_endpoints(
     match endpoint_mods {
         0 => {
             let v = read_int_values!(2);
-            *ep1 = clamp_color(0xFF, v[0], v[0], v[0]);
-            *ep2 = clamp_color(0xFF, v[1], v[1], v[1]);
+            ep1 = clamp_color(v[0], v[0], v[0], 0xFF);
+            ep2 = clamp_color(v[1], v[1], v[1], 0xFF);
         }
 
         1 => {
             let v = read_int_values!(2);
             let l0 = (v[0] >> 2) | (v[1] & 0xC0);
             let l1 = std::cmp::min(l0 + (v[1] & 0x3F), 0xFF);
-            *ep1 = clamp_color(0xFF, l0, l0, l0);
-            *ep2 = clamp_color(0xFF, l1, l1, l1);
+            ep1 = clamp_color(l0, l0, l0, 0xFF);
+            ep2 = clamp_color(l1, l1, l1, 0xFF);
         }
 
         4 => {
             let v = read_int_values!(4);
-            *ep1 = clamp_color(v[2], v[0], v[0], v[0]);
-            *ep2 = clamp_color(v[3], v[1], v[1], v[1]);
+            ep1 = clamp_color(v[0], v[0], v[0], v[2]);
+            ep2 = clamp_color(v[1], v[1], v[1], v[3]);
         }
 
         5 => {
             let mut v = read_int_values!(4);
             bts!(v, 1, 0);
             bts!(v, 3, 2);
-            *ep1 = clamp_color(v[2], v[0], v[0], v[0]);
-            *ep2 = clamp_color(v[2] + v[3], v[0] + v[1], v[0] + v[1], v[0] + v[1]);
+            ep1 = clamp_color(v[0], v[0], v[0], v[2]);
+            ep2 = clamp_color(v[0] + v[1], v[0] + v[1], v[0] + v[1], v[2] + v[3]);
         }
 
         6 => {
             let v = read_int_values!(4);
-            *ep1 = clamp_color(
-                0xFF,
+            ep1 = clamp_color(
                 (v[0] * v[3]) >> 8,
                 (v[1] * v[3]) >> 8,
                 (v[2] * v[3]) >> 8,
+                0xFF,
             );
-            *ep2 = clamp_color(0xFF, v[0], v[1], v[2]);
+            ep2 = clamp_color(v[0], v[1], v[2], 0xFF);
         }
 
         8 => {
             let v = read_int_values!(6);
             if v[1] + v[3] + v[5] >= v[0] + v[2] + v[4] {
-                *ep1 = clamp_color(0xFF, v[0], v[2], v[4]);
-                *ep2 = clamp_color(0xFF, v[1], v[3], v[5]);
+                ep1 = clamp_color(v[0], v[2], v[4], 0xFF);
+                ep2 = clamp_color(v[1], v[3], v[5], 0xFF);
             } else {
-                *ep1 = blue_contract(0xFF, v[1], v[3], v[5]);
-                *ep2 = blue_contract(0xFF, v[0], v[2], v[4]);
+                ep1 = blue_contract(v[1], v[3], v[5], 0xFF);
+                ep2 = blue_contract(v[0], v[2], v[4], 0xFF);
             }
         }
 
@@ -1207,33 +1188,33 @@ fn compute_endpoints(
             bts!(v, 3, 2);
             bts!(v, 5, 4);
             if v[1] + v[3] + v[5] >= 0 {
-                *ep1 = clamp_color(0xFF, v[0], v[2], v[4]);
-                *ep2 = clamp_color(0xFF, v[0] + v[1], v[2] + v[3], v[4] + v[5]);
+                ep1 = clamp_color(v[0], v[2], v[4], 0xFF);
+                ep2 = clamp_color(v[0] + v[1], v[2] + v[3], v[4] + v[5], 0xFF);
             } else {
-                *ep1 = blue_contract(0xFF, v[0] + v[1], v[2] + v[3], v[4] + v[5]);
-                *ep2 = blue_contract(0xFF, v[0], v[2], v[4]);
+                ep1 = blue_contract(v[0] + v[1], v[2] + v[3], v[4] + v[5], 0xFF);
+                ep2 = blue_contract(v[0], v[2], v[4], 0xFF);
             }
         }
 
         10 => {
             let v = read_int_values!(6);
-            *ep1 = clamp_color(
-                v[4],
+            ep1 = clamp_color(
                 (v[0] * v[3]) >> 8,
                 (v[1] * v[3]) >> 8,
                 (v[2] * v[3]) >> 8,
+                v[4],
             );
-            *ep2 = clamp_color(v[5], v[0], v[1], v[2]);
+            ep2 = clamp_color(v[0], v[1], v[2], v[5]);
         }
 
         12 => {
             let v = read_int_values!(8);
             if v[1] + v[3] + v[5] >= v[0] + v[2] + v[4] {
-                *ep1 = clamp_color(v[6], v[0], v[2], v[4]);
-                *ep2 = clamp_color(v[7], v[1], v[3], v[5]);
+                ep1 = clamp_color(v[0], v[2], v[4], v[6]);
+                ep2 = clamp_color(v[1], v[3], v[5], v[7]);
             } else {
-                *ep1 = blue_contract(v[7], v[1], v[3], v[5]);
-                *ep2 = blue_contract(v[6], v[0], v[2], v[4]);
+                ep1 = blue_contract(v[1], v[3], v[5], v[7]);
+                ep2 = blue_contract(v[0], v[2], v[4], v[6]);
             }
         }
 
@@ -1244,16 +1225,21 @@ fn compute_endpoints(
             bts!(v, 5, 4);
             bts!(v, 7, 6);
             if v[1] + v[3] + v[5] >= 0 {
-                *ep1 = clamp_color(v[6], v[0], v[2], v[4]);
-                *ep2 = clamp_color(v[7] + v[6], v[0] + v[1], v[2] + v[3], v[4] + v[5]);
+                ep1 = clamp_color(v[0], v[2], v[4], v[6]);
+                ep2 = clamp_color(v[0] + v[1], v[2] + v[3], v[4] + v[5], v[6] + v[7]);
             } else {
-                *ep1 = blue_contract(v[6] + v[7], v[0] + v[1], v[2] + v[3], v[4] + v[5]);
-                *ep2 = blue_contract(v[6], v[0], v[2], v[4]);
+                ep1 = blue_contract(v[0] + v[1], v[2] + v[3], v[4] + v[5], v[6] + v[7]);
+                ep2 = blue_contract(v[0], v[2], v[4], v[6]);
             }
         }
 
-        _ => panic!("Unsupported color endpoint mode (is it HDR?)"),
+        _ => {
+            // unsupported HDR modes
+            ep1 = [0xFF, 0, 0xFF, 0xFF];
+            ep2 = [0xFF, 0, 0xFF, 0xFF];
+        }
     }
+    [ep1, ep2]
 }
 
 /// Configuration for ASTC block footprint size
@@ -1497,28 +1483,13 @@ pub fn astc_decode_block<F: FnMut(u32, u32, [u8; 4])>(
     assert!(strm.get_bits_read() + weight_params.get_packed_bit_size() == 128);
 
     // Decode both color data and texel weight data
-    let mut color_values = [0; 32]; // Four values, two endpoints, four maximum paritions
-    decode_color_values(
-        &mut color_values,
-        endpoint_data,
-        &endpoint_mods,
-        n_partitions,
-        color_data_bits,
-    );
+    let color_values =
+        decode_color_values(endpoint_data, &endpoint_mods, n_partitions, color_data_bits);
 
     let mut endpoints = [[[0; 4]; 2]; 4];
     let mut color_values_ptr = &color_values[..];
     for i in 0..n_partitions {
-        let mut a = [0; 4];
-        let mut b = [0; 4];
-        compute_endpoints(
-            &mut a,
-            &mut b,
-            &mut color_values_ptr,
-            endpoint_mods[i as usize],
-        );
-        endpoints[i as usize][0] = a;
-        endpoints[i as usize][1] = b;
+        endpoints[i] = compute_endpoints(&mut color_values_ptr, endpoint_mods[i]);
     }
 
     // Read the texel weight data..
@@ -1527,21 +1498,15 @@ pub fn astc_decode_block<F: FnMut(u32, u32, [u8; 4])>(
     // Make sure that higher non-texel bits are set to zero
     texel_weight_data &= (1 << weight_params.get_packed_bit_size()) - 1;
 
-    let mut texel_weight_values = vec![];
-
     let mut weight_stream = InputBitStream::new(texel_weight_data);
 
-    decode_integer_sequence(
-        &mut texel_weight_values,
+    let texel_weight_values = decode_integer_sequence(
         &mut weight_stream,
         weight_params.max_weight,
         weight_params.get_num_weight_values(),
     );
 
-    // Blocks can be at most 12x12, so we can have as many as 144 weights
-    let mut weights = [[0; 144]; 2];
-    unquantize_texel_weights(
-        &mut weights,
+    let weights = unquantize_texel_weights(
         &texel_weight_values,
         &weight_params,
         block_width,
@@ -1563,8 +1528,8 @@ pub fn astc_decode_block<F: FnMut(u32, u32, [u8; 4])>(
 
             let mut p = [0; 4];
             for (c, p) in p.iter_mut().enumerate() {
-                let c0 = replicate(endpoints[partition][0][c] as u32, 8, 16);
-                let c1 = replicate(endpoints[partition][1][c] as u32, 8, 16);
+                let c0 = endpoints[partition][0][c] as u32 * 0x101;
+                let c1 = endpoints[partition][1][c] as u32 * 0x101;
 
                 let mut plane = 0;
                 if weight_params.is_dual_plane && (plane_idx & 3 == c as u32) {
