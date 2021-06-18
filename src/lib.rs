@@ -619,19 +619,8 @@ fn replicate(val: u32, mut num_bits: u32, to_bit: u32) -> u32 {
     res
 }
 
-fn decode_color_values(
-    data: u128,
-    modes: &[u32],
-    n_partitions: usize,
-    n_bits_for_color_data: u32,
-) -> [u8; 32] {
+fn decode_color_values(data: u128, n_values: u32, n_bits_for_color_data: u32) -> [u8; 32] {
     let mut out = [0; 32]; // Four values, two endpoints, four maximum paritions
-
-    // First figure out how many color values we have
-    let n_values = modes[0..n_partitions]
-        .iter()
-        .map(|m| ((m >> 2) + 1) << 1)
-        .sum();
 
     // Then based on the number of values and the remaining number of bits,
     // figure out the max value for each of them...
@@ -1355,7 +1344,7 @@ pub fn astc_decode_block<F: FnMut(u32, u32, [u8; 4])>(
     input: &[u8; 16],
     footprint: Footprint,
     mut writer: F,
-) {
+) -> bool {
     let block_width = footprint.block_width;
     let block_height = footprint.block_height;
     let mut strm = InputBitStream::new(u128::from_le_bytes(*input));
@@ -1364,27 +1353,39 @@ pub fn astc_decode_block<F: FnMut(u32, u32, [u8; 4])>(
     // Was there an error?
     if weight_params.is_error {
         fill_error(&mut writer, block_width, block_height);
-        return;
+        return false;
     }
 
     if weight_params.void_extent_ldr {
         fill_void_extent_ldr(&mut strm, &mut writer, block_width, block_height);
-        return;
+        return true;
     }
 
     if weight_params.void_extent_hdr {
         fill_error(&mut writer, block_width, block_height);
-        return;
+        return false;
     }
 
     if weight_params.width > block_width {
         fill_error(&mut writer, block_width, block_height);
-        return;
+        return false;
     }
 
     if weight_params.height > block_height {
         fill_error(&mut writer, block_width, block_height);
-        return;
+        return false;
+    }
+
+    if weight_params.get_num_weight_values() > 64 {
+        fill_error(&mut writer, block_width, block_height);
+        return false;
+    }
+
+    let n_weight_bits = weight_params.get_packed_bit_size();
+
+    if !(24..=96).contains(&n_weight_bits) {
+        fill_error(&mut writer, block_width, block_height);
+        return false;
     }
 
     // Read num partitions
@@ -1393,7 +1394,7 @@ pub fn astc_decode_block<F: FnMut(u32, u32, [u8; 4])>(
 
     if n_partitions == 4 && weight_params.is_dual_plane {
         fill_error(&mut writer, block_width, block_height);
-        return;
+        return false;
     }
 
     // Based on the number of partitions, read the color endpoint32 mode for
@@ -1415,9 +1416,7 @@ pub fn astc_decode_block<F: FnMut(u32, u32, [u8; 4])>(
     }
     let base_mode = base_cem & 3;
 
-    // Remaining bits are color endpoint32 data...
-    let n_weight_bits = weight_params.get_packed_bit_size();
-    let mut remaining_bits = 128 - n_weight_bits - strm.get_bits_read();
+    let mut non_color_bits = n_weight_bits + strm.get_bits_read();
 
     // Consider extra bits prior to texel data...
     let mut extra_cem_bits = 0;
@@ -1429,17 +1428,22 @@ pub fn astc_decode_block<F: FnMut(u32, u32, [u8; 4])>(
             _ => panic!(),
         }
     }
-    remaining_bits -= extra_cem_bits;
+    non_color_bits += extra_cem_bits;
 
     // Do we have a dual plane situation?
     let mut plane_selector_bits = 0;
     if weight_params.is_dual_plane {
         plane_selector_bits = 2;
     }
-    remaining_bits -= plane_selector_bits;
+    non_color_bits += plane_selector_bits;
+
+    if non_color_bits >= 128 {
+        fill_error(&mut writer, block_width, block_height);
+        return false;
+    }
 
     // Read color data...
-    let color_data_bits = remaining_bits;
+    let color_data_bits = 128 - non_color_bits;
     let endpoint_data = strm.read_bits128(color_data_bits);
 
     // Read the plane selection bits
@@ -1482,9 +1486,19 @@ pub fn astc_decode_block<F: FnMut(u32, u32, [u8; 4])>(
     }
     assert!(strm.get_bits_read() + weight_params.get_packed_bit_size() == 128);
 
+    // Figure out how many color values we have
+    let n_values = endpoint_mods[0..n_partitions]
+        .iter()
+        .map(|m| ((m >> 2) + 1) << 1)
+        .sum();
+
+    if n_values > 18 || (n_values * 13 + 4) / 5 > color_data_bits {
+        fill_error(&mut writer, block_width, block_height);
+        return false;
+    }
+
     // Decode both color data and texel weight data
-    let color_values =
-        decode_color_values(endpoint_data, &endpoint_mods, n_partitions, color_data_bits);
+    let color_values = decode_color_values(endpoint_data, n_values, color_data_bits);
 
     let mut endpoints = [[[0; 4]; 2]; 4];
     let mut color_values_ptr = &color_values[..];
@@ -1544,6 +1558,8 @@ pub fn astc_decode_block<F: FnMut(u32, u32, [u8; 4])>(
             writer(i, j, p);
         }
     }
+
+    true
 }
 
 /// Decode an ASTC image, assuming linear block layout.
@@ -1589,7 +1605,7 @@ pub fn astc_decode<R: Read, F: FnMut(u32, u32, [u8; 4])>(
                 if x < width && y < height {
                     writer(x, y, v)
                 }
-            })
+            });
         }
     }
 
@@ -1638,7 +1654,7 @@ mod tests {
     }
 
     #[test]
-    fn it_works() {
+    fn real_image() {
         tc!("atlas_small", 4, 4);
         tc!("atlas_small", 5, 5);
         tc!("atlas_small", 6, 6);
@@ -1662,5 +1678,31 @@ mod tests {
         tc!("rgb", 6, 6);
         tc!("rgb", 8, 8);
         tc!("rgb", 12, 12);
+    }
+
+    fn fuzz_fp(w: u32, h: u32) {
+        let footprint = Footprint::new(w, h);
+        for _ in 0..1000 {
+            let block = rand::random();
+            astc_decode_block(&block, footprint, |_, _, _| {});
+        }
+    }
+
+    #[test]
+    fn fuzzing() {
+        fuzz_fp(4, 4);
+        fuzz_fp(5, 4);
+        fuzz_fp(5, 5);
+        fuzz_fp(6, 5);
+        fuzz_fp(6, 6);
+        fuzz_fp(8, 5);
+        fuzz_fp(8, 6);
+        fuzz_fp(8, 8);
+        fuzz_fp(10, 5);
+        fuzz_fp(10, 6);
+        fuzz_fp(10, 8);
+        fuzz_fp(10, 10);
+        fuzz_fp(12, 10);
+        fuzz_fp(12, 12);
     }
 }
