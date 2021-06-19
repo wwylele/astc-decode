@@ -440,6 +440,29 @@ static ENCODING_MAP: [IntegerEncoding; 256] = {
     result
 };
 
+static ENCODING_SEQ: ([IntegerEncoding; 256], usize) = {
+    let mut result = [IntegerEncoding {
+        encoding: IntegerEncodingType::JustBits,
+        num_bits: 0,
+    }; 256];
+    let mut len = 1;
+    result[0] = ENCODING_MAP[0];
+    let mut i = 1;
+    while i < 256 {
+        let encoding = ENCODING_MAP[i];
+        let previous = result[len - 1];
+        // HACK: should be encoding != previous, but Eq in const is not usable right now
+        if encoding.encoding as u32 != previous.encoding as u32
+            || encoding.num_bits != previous.num_bits
+        {
+            result[len] = encoding;
+            len += 1;
+        }
+        i += 1;
+    }
+    (result, len)
+};
+
 struct TexelWeightParams {
     width: u32,
     height: u32,
@@ -721,11 +744,9 @@ fn decode_color_values(data: u128, n_values: u32, n_bits_for_color_data: u32) ->
 
     // Based on the number of values and the remaining number of bits,
     // figure out the encoding...
-    let encoding = ENCODING_MAP
-        .iter()
-        .rev()
-        .find(|v| v.get_bit_length(n_values) <= n_bits_for_color_data)
-        .unwrap();
+    let encoding_i = ENCODING_SEQ.0[0..ENCODING_SEQ.1]
+        .partition_point(|v| v.get_bit_length(n_values) <= n_bits_for_color_data);
+    let encoding = ENCODING_SEQ.0[encoding_i - 1];
 
     // We now have enough to decode our integer sequence.
     let mut color_stream = InputBitStream::new(data);
