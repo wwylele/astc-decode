@@ -82,19 +82,6 @@ impl Bits {
     }
 }
 
-#[derive(PartialEq, Eq)]
-enum IntegerEncoding {
-    JustBits,
-    Quint(u32),
-    Trit(u32),
-}
-
-struct IntegerEncodedValue {
-    encoding: IntegerEncoding,
-    num_bits: u32,
-    bit_value: u32,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum IntegerEncodingType {
     JustBits,
@@ -103,13 +90,13 @@ enum IntegerEncodingType {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct IntegerEncodingFormat {
+struct IntegerEncoding {
     encoding: IntegerEncodingType,
     num_bits: u32,
 }
 
-impl IntegerEncodingFormat {
-    // Returns the number of bits required to encode nVals values.
+impl IntegerEncoding {
+    // Returns the number of bits required to encode n_vals values.
     fn get_bit_length(&self, n_vals: u32) -> u32 {
         let mut total_bits = self.num_bits * n_vals;
         match self.encoding {
@@ -121,11 +108,176 @@ impl IntegerEncodingFormat {
     }
 }
 
-fn decode_trit_block(
-    bits: &mut InputBitStream,
-    result: &mut Vec<IntegerEncodedValue>,
-    bits_per_value: u32,
-) {
+fn decode_color(a: u32, b: u32, c: u32, d: u32) -> u8 {
+    let t = (d * c + b) ^ a;
+    u8::try_from((a & 0x80) | (t >> 2)).unwrap()
+}
+
+fn decode_weight(a: u32, b: u32, c: u32, d: u32) -> u32 {
+    let t = (d * c + b) ^ a;
+    (a & 0x20) | (t >> 2)
+}
+
+struct Trit {
+    trit_value: u32,
+    bit_value: u32,
+}
+
+impl Trit {
+    fn decode_color(self, bitlen: u32) -> u8 {
+        let bitval = self.bit_value;
+        let a = (bitval & 1) * 0x1FF;
+        let x = bitval >> 1;
+        let b;
+        let c;
+        match bitlen {
+            1 => {
+                c = 204;
+                b = 0;
+            }
+
+            2 => {
+                c = 93;
+                // b = b000b0bb0
+                b = (x << 8) | (x << 4) | (x << 2) | (x << 1);
+            }
+
+            3 => {
+                c = 44;
+                // b = cb000cbcb
+                b = (x << 7) | (x << 2) | x;
+            }
+
+            4 => {
+                c = 22;
+                // b = dcb000dcb
+                b = (x << 6) | x;
+            }
+
+            5 => {
+                c = 11;
+                // b = edcb000ed
+                b = (x << 5) | (x >> 2);
+            }
+
+            6 => {
+                c = 5;
+                // b = fedcb000f
+                b = (x << 4) | (x >> 4);
+            }
+
+            _ => unreachable!("Invalid trit encoding for color values"),
+        }
+        decode_color(a, b, c, self.trit_value)
+    }
+
+    fn decode_weight(self, bitlen: u32) -> u32 {
+        let bitval = self.bit_value;
+        let a = (bitval & 1) * 0x7F;
+        let x = bitval >> 1;
+        let b;
+        let c;
+        match bitlen {
+            0 => {
+                return [0, 32, 63][self.trit_value as usize];
+            }
+
+            1 => {
+                c = 50;
+                b = 0;
+            }
+
+            2 => {
+                c = 23;
+                b = (x << 6) | (x << 2) | x;
+            }
+
+            3 => {
+                c = 11;
+                b = (x << 5) | x;
+            }
+
+            _ => unreachable!("Invalid trit encoding for texel weight"),
+        }
+        decode_weight(a, b, c, self.trit_value)
+    }
+}
+
+struct Quint {
+    quint_value: u32,
+    bit_value: u32,
+}
+
+impl Quint {
+    fn decode_color(self, bitlen: u32) -> u8 {
+        let bitval = self.bit_value;
+        let a = (bitval & 1) * 0x1FF;
+        let x = bitval >> 1;
+        let b;
+        let c;
+        match bitlen {
+            1 => {
+                c = 113;
+                b = 0;
+            }
+
+            2 => {
+                c = 54;
+                // b = b0000bb00
+                b = (x << 8) | (x << 3) | (x << 2);
+            }
+
+            3 => {
+                c = 26;
+                // b = cb0000cbc
+                b = (x << 7) | (x << 1) | (x >> 1);
+            }
+
+            4 => {
+                c = 13;
+                // b = dcb0000dc
+                b = (x << 6) | (x >> 1);
+            }
+
+            5 => {
+                c = 6;
+                // b = edcb0000e
+                b = (x << 5) | (x >> 3);
+            }
+
+            _ => unreachable!("Invalid quint encoding for color values"),
+        }
+        decode_color(a, b, c, self.quint_value)
+    }
+
+    fn decode_weight(self, bitlen: u32) -> u32 {
+        let bitval = self.bit_value;
+        let a = (bitval & 1) * 0x7F;
+        let b;
+        let c;
+        match bitlen {
+            0 => {
+                return [0, 16, 32, 47, 63][self.quint_value as usize];
+            }
+
+            1 => {
+                c = 28;
+                b = 0;
+            }
+
+            2 => {
+                c = 13;
+                let x = bitval >> 1;
+                b = (x << 6) | (x << 1);
+            }
+
+            _ => unreachable!("Invalid quint encoding for texel weight"),
+        }
+        decode_weight(a, b, c, self.quint_value)
+    }
+}
+
+fn decode_trit_block(bits: &mut InputBitStream, bits_per_value: u32) -> impl Iterator<Item = Trit> {
     // Implement the algorithm in section c.2.12
     let mut m = [0u32; 5];
     let mut t = [0u32; 5];
@@ -177,22 +329,18 @@ fn decode_trit_block(
         t[0] = (cb.get(1) << 1) | (cb.get(0) & !cb.get(1));
     }
 
-    for i in 0..5 {
-        let bit_value = m[i];
-        let trit_value = t[i];
-        result.push(IntegerEncodedValue {
-            encoding: IntegerEncoding::Trit(trit_value),
+    IntoIterator::into_iter(m)
+        .zip(t)
+        .map(|(bit_value, trit_value)| Trit {
+            trit_value,
             bit_value,
-            num_bits: bits_per_value,
         })
-    }
 }
 
 fn decode_quint_block(
     bits: &mut InputBitStream,
-    result: &mut Vec<IntegerEncodedValue>,
     bits_per_value: u32,
-) {
+) -> impl Iterator<Item = Quint> {
     // Implement the algorithm in section c.2.12
     let mut m = [0u32; 3];
     let mut q = [0u32; 3];
@@ -232,26 +380,22 @@ fn decode_quint_block(
         }
     }
 
-    for i in 0..3 {
-        let bit_value = m[i];
-        let quint_value = q[i];
-        result.push(IntegerEncodedValue {
-            encoding: IntegerEncoding::Quint(quint_value),
+    IntoIterator::into_iter(m)
+        .zip(q)
+        .map(|(bit_value, quint_value)| Quint {
+            quint_value,
             bit_value,
-            num_bits: bits_per_value,
         })
-    }
 }
 
-// Returns a new instance of this struct that corresponds to the
-// can take no more than maxval values
-const fn create_encoding(mut max_val: u32) -> IntegerEncodingFormat {
+// Returns IntegerEncoding that can take no more than maxval values
+const fn create_encoding(mut max_val: u32) -> IntegerEncoding {
     while max_val > 0 {
         let check = max_val + 1;
 
         // Is max_val a power of two?
         if (check & (check - 1)) == 0 {
-            return IntegerEncodingFormat {
+            return IntegerEncoding {
                 encoding: IntegerEncodingType::JustBits,
                 num_bits: max_val.count_ones(),
             };
@@ -259,7 +403,7 @@ const fn create_encoding(mut max_val: u32) -> IntegerEncodingFormat {
 
         // Is max_val of the type 3*2^n - 1?
         if (check % 3 == 0) && ((check / 3) & ((check / 3) - 1)) == 0 {
-            return IntegerEncodingFormat {
+            return IntegerEncoding {
                 encoding: IntegerEncodingType::Trit,
                 num_bits: (check / 3 - 1).count_ones(),
             };
@@ -267,7 +411,7 @@ const fn create_encoding(mut max_val: u32) -> IntegerEncodingFormat {
 
         // Is max_val of the type 5*2^n - 1?
         if (check % 5 == 0) && ((check / 5) & ((check / 5) - 1)) == 0 {
-            return IntegerEncodingFormat {
+            return IntegerEncoding {
                 encoding: IntegerEncodingType::Quint,
                 num_bits: (check / 5 - 1).count_ones(),
             };
@@ -277,14 +421,14 @@ const fn create_encoding(mut max_val: u32) -> IntegerEncodingFormat {
         // just iterate.
         max_val -= 1;
     }
-    IntegerEncodingFormat {
+    IntegerEncoding {
         encoding: IntegerEncodingType::JustBits,
         num_bits: 0,
     }
 }
 
-static ENCODINGS_VALUES: [IntegerEncodingFormat; 256] = {
-    let mut result = [IntegerEncodingFormat {
+static ENCODING_MAP: [IntegerEncoding; 256] = {
+    let mut result = [IntegerEncoding {
         encoding: IntegerEncodingType::JustBits,
         num_bits: 0,
     }; 256];
@@ -295,47 +439,6 @@ static ENCODINGS_VALUES: [IntegerEncodingFormat; 256] = {
     }
     result
 };
-
-// Fills result with the values that are encoded in the given
-// bitstream. We must know beforehand what the maximum possible
-// value is, and how many values we're decoding.
-fn decode_integer_sequence(
-    bits: &mut InputBitStream,
-    max_range: u32,
-    n_values: u32,
-) -> Vec<IntegerEncodedValue> {
-    let mut result = vec![];
-
-    // Determine encoding parameters
-    let val = ENCODINGS_VALUES[max_range as usize];
-
-    // Start decoding
-    let mut n_vals_decoded = 0;
-    while n_vals_decoded < n_values {
-        match val.encoding {
-            IntegerEncodingType::Quint => {
-                decode_quint_block(bits, &mut result, val.num_bits);
-                n_vals_decoded += 3;
-            }
-
-            IntegerEncodingType::Trit => {
-                decode_trit_block(bits, &mut result, val.num_bits);
-                n_vals_decoded += 5;
-            }
-            IntegerEncodingType::JustBits => {
-                let bit_value = bits.read_bits(val.num_bits);
-                result.push(IntegerEncodedValue {
-                    num_bits: val.num_bits,
-                    bit_value,
-                    encoding: IntegerEncoding::JustBits,
-                });
-                n_vals_decoded += 1;
-            }
-        }
-    }
-
-    result
-}
 
 struct TexelWeightParams {
     width: u32,
@@ -363,7 +466,7 @@ impl Default for TexelWeightParams {
 
 impl TexelWeightParams {
     fn get_packed_bit_size(&self) -> u32 {
-        ENCODINGS_VALUES[self.max_weight as usize].get_bit_length(self.get_num_weight_values())
+        ENCODING_MAP[self.max_weight as usize].get_bit_length(self.get_num_weight_values())
     }
 
     fn get_num_weight_values(&self) -> u32 {
@@ -463,8 +566,6 @@ fn decode_block_info(strm: &mut InputBitStream) -> TexelWeightParams {
         }
     }
 
-    assert!(layout < 10);
-
     // Determine R
     let mut r = (mode_bits & 0x10) >> 4;
     if layout < 5 {
@@ -540,7 +641,7 @@ fn decode_block_info(strm: &mut InputBitStream) -> TexelWeightParams {
             params.height = b + 6;
         }
 
-        _ => panic!("Don't know this layout..."),
+        _ => unreachable!("Impossible layout"),
     }
 
     // Determine whether or not we're using dual planes
@@ -548,13 +649,12 @@ fn decode_block_info(strm: &mut InputBitStream) -> TexelWeightParams {
     let dp = (layout != 9) && (mode_bits & 0x400) != 0;
     let p = (layout != 9) && (mode_bits & 0x200) != 0;
 
-    if p {
-        const MAX_WEIGHTS: [u32; 6] = [9, 11, 15, 19, 23, 31];
-        params.max_weight = MAX_WEIGHTS[(r - 2) as usize];
+    let max_weights = if p {
+        [9, 11, 15, 19, 23, 31]
     } else {
-        const MAX_WEIGHTS: [u32; 6] = [1, 2, 3, 4, 5, 7];
-        params.max_weight = MAX_WEIGHTS[(r - 2) as usize];
-    }
+        [1, 2, 3, 4, 5, 7]
+    };
+    params.max_weight = max_weights[(r - 2) as usize];
 
     params.is_dual_plane = dp;
 
@@ -595,289 +695,118 @@ fn fill_error<F: FnMut(u32, u32, [u8; 4])>(writer: &mut F, block_width: u32, blo
 
 // Replicates low num_bits such that [(to_bit - 1):(to_bit - num_bits)]
 // is the same as [(num_bits - 1):0] and repeats all the way down.
-fn replicate(val: u32, mut num_bits: u32, to_bit: u32) -> u32 {
+fn replicate(val: u32, num_bits: u32, to_bit: u32) -> u32 {
     if num_bits == 0 {
         return 0;
     }
     if to_bit == 0 {
         return 0;
     }
-    let v = val & ((1 << num_bits) - 1);
-    let mut res = v;
-    let mut reslen = num_bits;
-    while reslen < to_bit {
-        let mut comp = 0;
-        if num_bits > to_bit - reslen {
-            let newshift = to_bit - reslen;
-            comp = num_bits - newshift;
-            num_bits = newshift;
+
+    let mut res = val << (to_bit - num_bits);
+    let mut shift = num_bits;
+    loop {
+        let next = res >> shift;
+        if next == 0 {
+            return res;
         }
-        res <<= num_bits;
-        res |= v >> comp;
-        reslen += num_bits;
+        res |= next;
+        shift *= 2;
     }
-    res
 }
 
-fn decode_color_values(data: u128, n_values: u32, n_bits_for_color_data: u32) -> [u8; 32] {
-    let mut out = [0; 32]; // Four values, two endpoints, four maximum paritions
+fn decode_color_values(data: u128, n_values: u32, n_bits_for_color_data: u32) -> [u8; 18] {
+    let mut out = [0; 18];
+    let out_range = &mut out[0..n_values as usize];
 
-    // Then based on the number of values and the remaining number of bits,
-    // figure out the max value for each of them...
-    let mut range = 256;
-    range -= 1;
-    while range > 0 {
-        let val = ENCODINGS_VALUES[range];
-        let bit_length = val.get_bit_length(n_values);
-        if bit_length <= n_bits_for_color_data {
-            // Find the smallest possible range that matches the given encoding
-            range -= 1;
-            while range > 0 {
-                let newval = ENCODINGS_VALUES[range];
-                if newval != val {
-                    break;
-                }
-                range -= 1;
-            }
-
-            // Return to last matching range.
-            range += 1;
-            break;
-        }
-        range -= 1;
-    }
+    // Based on the number of values and the remaining number of bits,
+    // figure out the encoding...
+    let encoding = ENCODING_MAP
+        .iter()
+        .rev()
+        .find(|v| v.get_bit_length(n_values) <= n_bits_for_color_data)
+        .unwrap();
 
     // We now have enough to decode our integer sequence.
     let mut color_stream = InputBitStream::new(data);
-    let decoded_color_values = decode_integer_sequence(&mut color_stream, range as u32, n_values);
-
-    // Once we have the decoded values, we need to dequantize them to the 0-255 range
-    // This procedure is outlined in ASTC spec c.2.13
-    let mut out_idx = 0;
-    for val in decoded_color_values {
-        // Have we already decoded all that we need?
-        if out_idx >= n_values {
-            break;
+    match encoding.encoding {
+        IntegerEncodingType::JustBits => {
+            for out in out_range {
+                *out = replicate(
+                    color_stream.read_bits(encoding.num_bits),
+                    encoding.num_bits,
+                    8,
+                ) as u8;
+            }
         }
-
-        let bitlen = val.num_bits;
-        let bitval = val.bit_value;
-
-        assert!(bitlen >= 1);
-
-        // a is just the lsb replicated 9 times.
-        let a = (bitval & 1) * 0x1FF;
-        let mut b = 0;
-        let mut c = 0;
-        let mut d = 0;
-
-        match val.encoding {
-            // replicate bits
-            IntegerEncoding::JustBits => {
-                out[out_idx as usize] = u8::try_from(replicate(bitval, bitlen, 8)).unwrap();
-                out_idx += 1;
+        IntegerEncodingType::Trit => {
+            for (out, result) in out_range
+                .iter_mut()
+                .zip((0..).flat_map(|_| decode_trit_block(&mut color_stream, encoding.num_bits)))
+            {
+                *out = result.decode_color(encoding.num_bits);
             }
-
-            // Use algorithm in c.2.13
-            IntegerEncoding::Trit(trit_value) => {
-                d = trit_value;
-
-                match bitlen {
-                    1 => {
-                        c = 204;
-                    }
-
-                    2 => {
-                        c = 93;
-                        // b = b000b0bb0
-                        let x = (bitval >> 1) & 1;
-                        b = (x << 8) | (x << 4) | (x << 2) | (x << 1);
-                    }
-
-                    3 => {
-                        c = 44;
-                        // b = cb000cbcb
-                        let cb = (bitval >> 1) & 3;
-                        b = (cb << 7) | (cb << 2) | cb;
-                    }
-
-                    4 => {
-                        c = 22;
-                        // b = dcb000dcb
-                        let dcb = (bitval >> 1) & 7;
-                        b = (dcb << 6) | dcb;
-                    }
-
-                    5 => {
-                        c = 11;
-                        // b = edcb000ed
-                        let edcb = (bitval >> 1) & 0xF;
-                        b = (edcb << 5) | (edcb >> 2);
-                    }
-
-                    6 => {
-                        c = 5;
-                        // b = fedcb000f
-                        let fedcb = (bitval >> 1) & 0x1F;
-                        b = (fedcb << 4) | (fedcb >> 4);
-                    }
-
-                    _ => panic!("Unsupported trit encoding for color values!"),
-                }
+        }
+        IntegerEncodingType::Quint => {
+            for (out, result) in out_range
+                .iter_mut()
+                .zip((0..).flat_map(|_| decode_quint_block(&mut color_stream, encoding.num_bits)))
+            {
+                *out = result.decode_color(encoding.num_bits);
             }
-
-            IntegerEncoding::Quint(quint_value) => {
-                d = quint_value;
-
-                match bitlen {
-                    1 => {
-                        c = 113;
-                    }
-
-                    2 => {
-                        c = 54;
-                        // b = b0000bb00
-                        let x = (bitval >> 1) & 1;
-                        b = (x << 8) | (x << 3) | (x << 2);
-                    }
-
-                    3 => {
-                        c = 26;
-                        // b = cb0000cbc
-                        let cb = (bitval >> 1) & 3;
-                        b = (cb << 7) | (cb << 1) | (cb >> 1);
-                    }
-
-                    4 => {
-                        c = 13;
-                        // b = dcb0000dc
-                        let dcb = (bitval >> 1) & 7;
-                        b = (dcb << 6) | (dcb >> 1);
-                    }
-
-                    5 => {
-                        c = 6;
-                        // b = edcb0000e
-                        let edcb = (bitval >> 1) & 0xF;
-                        b = (edcb << 5) | (edcb >> 3);
-                    }
-
-                    _ => panic!("Unsupported quint encoding for color values!"),
-                }
-            }
-        } // switch(val.encoding)
-
-        if val.encoding != IntegerEncoding::JustBits {
-            let mut t = d * c + b;
-            t ^= a;
-            t = (a & 0x80) | (t >> 2);
-            out[out_idx as usize] = u8::try_from(t).unwrap();
-            out_idx += 1;
         }
     }
+
     out
 }
 
-fn unquantize_texel_weight(val: &IntegerEncodedValue) -> u32 {
-    let bitval = val.bit_value;
-    let bitlen = val.num_bits;
-
-    let a = (bitval & 1) * 0x7F;
-    let mut b = 0;
-    let mut c = 0;
-    let mut d = 0;
-
-    let mut result = 0;
-    match val.encoding {
-        IntegerEncoding::JustBits => {
-            result = replicate(bitval, bitlen, 6);
-        }
-
-        IntegerEncoding::Trit(trit_value) => {
-            d = trit_value;
-            assert!(d < 3);
-
-            match bitlen {
-                0 => {
-                    result = [0, 32, 63][d as usize];
-                }
-
-                1 => {
-                    c = 50;
-                }
-
-                2 => {
-                    c = 23;
-                    let x = (bitval >> 1) & 1;
-                    b = (x << 6) | (x << 2) | x;
-                }
-
-                3 => {
-                    c = 11;
-                    let cb = (bitval >> 1) & 3;
-                    b = (cb << 5) | cb;
-                }
-
-                _ => panic!("Invalid trit encoding for texel weight"),
-            }
-        }
-
-        IntegerEncoding::Quint(quint_value) => {
-            d = quint_value;
-            assert!(d < 5);
-
-            match bitlen {
-                0 => {
-                    result = [0, 16, 32, 47, 63][d as usize];
-                }
-
-                1 => {
-                    c = 28;
-                }
-
-                2 => {
-                    c = 13;
-                    let x = (bitval >> 1) & 1;
-                    b = (x << 6) | (x << 1);
-                }
-
-                _ => panic!("Invalid quint encoding for texel weight"),
-            }
-        }
-    }
-
-    if val.encoding != IntegerEncoding::JustBits && bitlen > 0 {
-        // Decode the value...
-        result = d * c + b;
-        result ^= a;
-        result = (a & 0x20) | (result >> 2);
-    }
-
-    assert!(result < 64);
-
-    // Change from [0,63] to [0,64]
-    if result > 32 {
-        result += 1;
-    }
-
-    result
-}
-
 fn unquantize_texel_weights(
-    weights: &[IntegerEncodedValue],
+    weights_stream: &mut InputBitStream,
     params: &TexelWeightParams,
     block_width: u32,
     block_height: u32,
 ) -> [[u32; 144]; 2] {
     // Blocks can be at most 12x12, so we can have as many as 144 weights
     let mut out = [[0; 144]; 2];
-    let mut unquantized = [[0; 144]; 2];
+    let mut unquantized = [0; 96];
 
     let plane_scale = if params.is_dual_plane { 2 } else { 1 };
 
-    for (i, weight_chunk) in weights.chunks_exact(plane_scale).enumerate() {
-        for (plane, weight) in weight_chunk.iter().enumerate() {
-            unquantized[plane][i] = unquantize_texel_weight(weight);
+    let unquantized_range = &mut unquantized[0..params.get_num_weight_values() as usize];
+    let encoding = ENCODING_MAP[params.max_weight as usize];
+
+    match encoding.encoding {
+        IntegerEncodingType::JustBits => {
+            for out in unquantized_range.iter_mut() {
+                *out = replicate(
+                    weights_stream.read_bits(encoding.num_bits),
+                    encoding.num_bits,
+                    6,
+                )
+            }
+        }
+        IntegerEncodingType::Trit => {
+            for (out, result) in unquantized_range
+                .iter_mut()
+                .zip((0..).flat_map(|_| decode_trit_block(weights_stream, encoding.num_bits)))
+            {
+                *out = result.decode_weight(encoding.num_bits);
+            }
+        }
+        IntegerEncodingType::Quint => {
+            for (out, result) in unquantized_range
+                .iter_mut()
+                .zip((0..).flat_map(|_| decode_quint_block(weights_stream, encoding.num_bits)))
+            {
+                *out = result.decode_weight(encoding.num_bits);
+            }
+        }
+    }
+
+    for weight in unquantized_range {
+        assert!(*weight < 64);
+        if *weight > 32 {
+            *weight += 1
         }
     }
 
@@ -913,19 +842,19 @@ fn unquantize_texel_weights(
                 let mut p11 = 0;
 
                 if v0 < (params.width * params.height) {
-                    p00 = unquantized[plane][v0 as usize];
+                    p00 = unquantized[plane + plane_scale * (v0 as usize)];
                 }
 
                 if v0 + 1 < (params.width * params.height) {
-                    p01 = unquantized[plane][(v0 + 1) as usize];
+                    p01 = unquantized[plane + plane_scale * ((v0 + 1) as usize)];
                 }
 
                 if v0 + params.width < (params.width * params.height) {
-                    p10 = unquantized[plane][(v0 + params.width) as usize];
+                    p10 = unquantized[plane + plane_scale * ((v0 + params.width) as usize)];
                 }
 
                 if v0 + params.width + 1 < (params.width * params.height) {
-                    p11 = unquantized[plane][(v0 + params.width + 1) as usize];
+                    p11 = unquantized[plane + plane_scale * ((v0 + params.width + 1) as usize)];
                 }
 
                 out[plane][(t * block_width + s) as usize] =
@@ -1331,6 +1260,7 @@ impl Footprint {
 ///     This function will be called once for each pixel `(x, y)` in the rectangle
 ///     `[0, footprint.width()) * [0, footprint.height())`.
 ///     Each element in `color` represents the R, G, B, and A channel, respectively.
+///  - returns `true` if the block is successfully decoded; `false` if the block contains illegal encoding.
 /// ```
 /// let footprint = astc_decode::Footprint::new(6, 6);
 /// // Exmaple input. Not necessarily a valid ASTC block
@@ -1404,6 +1334,7 @@ pub fn astc_decode_block<F: FnMut(u32, u32, [u8; 4])>(
     let plane_idx;
     let partition_index;
     let mut endpoint_mods = [0, 0, 0, 0];
+    let endpoint_mods = &mut endpoint_mods[0..n_partitions];
 
     // Read extra config data...
     let mut base_cem = 0;
@@ -1425,7 +1356,7 @@ pub fn astc_decode_block<F: FnMut(u32, u32, [u8; 4])>(
             2 => extra_cem_bits += 2,
             3 => extra_cem_bits += 5,
             4 => extra_cem_bits += 8,
-            _ => panic!(),
+            _ => unreachable!(),
         }
     }
     non_color_bits += extra_cem_bits;
@@ -1467,7 +1398,7 @@ pub fn astc_decode_block<F: FnMut(u32, u32, [u8; 4])>(
             cem >>= 2;
         }
 
-        for (i, endpoint_mod) in endpoint_mods[0..n_partitions].iter_mut().enumerate() {
+        for (i, endpoint_mod) in endpoint_mods.iter_mut().enumerate() {
             *endpoint_mod = base_mode;
             if !c[i] {
                 *endpoint_mod -= 1;
@@ -1481,47 +1412,38 @@ pub fn astc_decode_block<F: FnMut(u32, u32, [u8; 4])>(
     }
 
     // Make sure everything up till here is sane.
-    for &endpoint_mod in &endpoint_mods[0..n_partitions] {
+    for &endpoint_mod in endpoint_mods.iter() {
         assert!(endpoint_mod < 16);
     }
     assert!(strm.get_bits_read() + weight_params.get_packed_bit_size() == 128);
 
     // Figure out how many color values we have
-    let n_values = endpoint_mods[0..n_partitions]
-        .iter()
-        .map(|m| ((m >> 2) + 1) << 1)
-        .sum();
+    let n_values = endpoint_mods.iter().map(|m| ((m >> 2) + 1) << 1).sum();
 
     if n_values > 18 || (n_values * 13 + 4) / 5 > color_data_bits {
         fill_error(&mut writer, block_width, block_height);
         return false;
     }
 
-    // Decode both color data and texel weight data
+    // Decode color data
     let color_values = decode_color_values(endpoint_data, n_values, color_data_bits);
 
     let mut endpoints = [[[0; 4]; 2]; 4];
-    let mut color_values_ptr = &color_values[..];
+    let mut color_values_ptr = &color_values[0..n_values as usize];
     for i in 0..n_partitions {
         endpoints[i] = compute_endpoints(&mut color_values_ptr, endpoint_mods[i]);
     }
 
-    // Read the texel weight data..
+    // Read the texel weight data
     let mut texel_weight_data = u128::from_le_bytes(*input).reverse_bits();
 
     // Make sure that higher non-texel bits are set to zero
     texel_weight_data &= (1 << weight_params.get_packed_bit_size()) - 1;
 
+    // Decode weight data
     let mut weight_stream = InputBitStream::new(texel_weight_data);
-
-    let texel_weight_values = decode_integer_sequence(
-        &mut weight_stream,
-        weight_params.max_weight,
-        weight_params.get_num_weight_values(),
-    );
-
     let weights = unquantize_texel_weights(
-        &texel_weight_values,
+        &mut weight_stream,
         &weight_params,
         block_width,
         block_height,
@@ -1682,7 +1604,7 @@ mod tests {
 
     fn fuzz_fp(w: u32, h: u32) {
         let footprint = Footprint::new(w, h);
-        for _ in 0..1000 {
+        for _ in 0..10000 {
             let block = rand::random();
             astc_decode_block(&block, footprint, |_, _, _| {});
         }
